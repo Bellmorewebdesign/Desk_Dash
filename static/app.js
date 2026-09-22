@@ -84,7 +84,41 @@
   function controls(d) { var enabled = state.auth, units = d.controls.services || [], targets = d.controls.wake_targets || []; return head('OPERATIONS / ACTIONS', 'Control center', 'Approved actions only. Confirmations and cooldowns are enforced by the server.') + (!enabled ? '<div class="notice">Set DASH_PASSWORD and sign in to enable control actions.</div>' : '') + '<div class="grid three">' + card('<div><div class="card-label">WEBSITE MONITOR</div><h3>Refresh websites</h3><p>Queue an immediate check of configured sites.</p></div><button class="button" data-action="refresh_sites"' + (!enabled ? ' disabled' : '') + '>Refresh checks</button>', 'action-card') + card('<div><div class="card-label">NETWORK DIAGNOSTICS</div><h3>Run network test</h3><p>Measure DNS lookup and gateway TCP connectivity.</p></div><button class="button" data-action="network_test"' + (!enabled ? ' disabled' : '') + '>Run test</button>', 'action-card') + card('<div><div class="card-label">NVME / LIMITED WRITE</div><h3>Storage test</h3><p>Preview the NVMe target, confirm and verify a limited temporary file.</p></div><button class="button" data-action="storage_test"' + (!enabled || !d.storage_test_configured ? ' disabled' : '') + '>Preview target</button>', 'action-card') + (units.map(function (unit) { return card('<div><div class="card-label">ALLOWLISTED SYSTEMD UNIT</div><h3>' + esc(unit) + '</h3><p>Start, stop or restart this approved unit. Host permissions must allow the operation.</p></div><div class="actions"><button class="button" data-action="service" data-unit="' + esc(unit) + '" data-verb="start"' + (!enabled ? ' disabled' : '') + '>Start</button><button class="button" data-action="service" data-unit="' + esc(unit) + '" data-verb="restart"' + (!enabled ? ' disabled' : '') + '>Restart</button><button class="button danger" data-action="service" data-unit="' + esc(unit) + '" data-verb="stop"' + (!enabled ? ' disabled' : '') + '>Stop</button></div>', 'action-card'); }).join('')) + targets.map(function (id) { return card('<div><div class="card-label">WAKE-ON-LAN</div><h3>' + esc(id) + '</h3><p>Send a magic packet to this configured target.</p></div><button class="button" data-action="wake" data-target="' + esc(id) + '"' + (!enabled ? ' disabled' : '') + '>Send wake packet</button>', 'action-card'); }).join('') + (d.controls.reboot ? card('<div><div class="card-label">HOST POWER</div><h3>Reboot host</h3><p>Reboot this Ubuntu machine. Requires host permissions and explicit confirmation.</p></div><button class="button danger" data-action="reboot"' + (!enabled ? ' disabled' : '') + '>Reboot machine</button>', 'action-card') : '') + '</div><section class="section">' + card('<div class="card-label">PERMISSIONS</div><p class="muted">Action endpoints accept only named operations and configured targets. Service operations may need carefully scoped systemd permissions; no arbitrary commands or sudo password are available in the browser.</p>') + '</section>';
   }
   var pages = { overview: overview, systems: systems, storage: storage, websites: websites, services: services, network: network, activity: activity, controls: controls };
-  function render(animate) { $('breadcrumb').textContent = state.page.toUpperCase(); Array.prototype.forEach.call(document.querySelectorAll('#nav button'), function (b) { b.classList.toggle('active', b.getAttribute('data-page') === state.page); }); var content = $('content'), d = state.data; content.classList.toggle('quiet-update', animate === false); var html = d && d.system ? pages[state.page](d) : head('CONNECTING / HOST', 'Initializing monitor', 'Waiting for the first system sample…') + card('<div class="empty">Establishing a live connection to the dashboard backend.</div>'); if (content.innerHTML !== html) content.innerHTML = html; }
+  function patchNodes(parent, incoming) {
+    for (var i = 0; i < incoming.childNodes.length; i++) {
+      var next = incoming.childNodes[i], current = parent.childNodes[i];
+      if (!current) { parent.appendChild(next.cloneNode(true)); continue; }
+      if (current.nodeType !== next.nodeType || (current.nodeType === 1 && current.tagName !== next.tagName)) {
+        parent.replaceChild(next.cloneNode(true), current);
+      } else if (current.nodeType !== 1) {
+        if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
+      } else {
+        for (var old = current.attributes.length - 1; old >= 0; old--) {
+          if (!next.hasAttribute(current.attributes[old].name)) current.removeAttribute(current.attributes[old].name);
+        }
+        for (var attr = 0; attr < next.attributes.length; attr++) {
+          var item = next.attributes[attr];
+          if (current.getAttribute(item.name) !== item.value) current.setAttribute(item.name, item.value);
+        }
+        patchNodes(current, next);
+      }
+    }
+    while (parent.childNodes.length > incoming.childNodes.length) parent.removeChild(parent.lastChild);
+  }
+  function render(animate) {
+    $('breadcrumb').textContent = state.page.toUpperCase();
+    Array.prototype.forEach.call(document.querySelectorAll('#nav button'), function (b) { b.classList.toggle('active', b.getAttribute('data-page') === state.page); });
+    var content = $('content'), d = state.data;
+    content.classList.toggle('quiet-update', animate === false);
+    var html = d && d.system ? pages[state.page](d) : head('CONNECTING / HOST', 'Initializing monitor', 'Waiting for the first system sample…') + card('<div class="empty">Establishing a live connection to the dashboard backend.</div>');
+    if (animate !== false || !document.createElement) {
+      if (content.innerHTML !== html) content.innerHTML = html;
+    } else {
+      var template = document.createElement('template');
+      template.innerHTML = html;
+      patchNodes(content, template.content);
+    }
+  }
   async function api(path, options) { var res = await fetch(path, options || {}); var json = await res.json(); if (!res.ok) { var error = new Error(json.error || 'Request failed'); error.status = res.status; throw error; } return json; }
   function toast(message, error) { var el = $('toast'); el.textContent = message; el.classList.toggle('error', !!error); el.classList.remove('hidden'); clearTimeout(toast.timer); toast.timer = setTimeout(function () { el.classList.add('hidden'); }, 4500); }
   async function refresh() { if (state.passwordRequired && !state.auth) return; try { var result = await api('/api/snapshot'); state.data = result; if (state.filter && state.page === 'activity') { try { state.data.events = (await api('/api/events?kind=' + encodeURIComponent(state.filter))).events; } catch (_) {} } $('sync-badge').textContent = 'LIVE CONNECTION'; $('sync-badge').classList.remove('error'); $('side-time').textContent = 'Updated ' + new Date().toLocaleTimeString(); render(false); } catch (err) { if (err.status === 401) { state.auth = false; $('login').classList.remove('hidden'); } $('sync-badge').textContent = 'CONNECTION LOST'; $('sync-badge').classList.add('error'); } }
@@ -113,5 +147,5 @@
   $('login-form').onsubmit = async function (e) { e.preventDefault(); try { var result = await api('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: $('password').value }) }); $('password').value = ''; $('login-error').textContent = ''; state.auth = true; state.csrf = result.csrf; $('login').classList.add('hidden'); $('logout').classList.remove('hidden'); refresh(); history(); } catch (err) { $('login-error').textContent = err.message; } };
   $('logout').onclick = async function () { try { await api('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': state.csrf }, body: '{}' }); } catch (_) {} state.auth = false; state.data = null; $('login').classList.remove('hidden'); $('logout').classList.add('hidden'); render(); };
   document.addEventListener('change', function (e) { if (e.target.id === 'event-filter') { state.filter = e.target.value; api('/api/events?kind=' + encodeURIComponent(state.filter)).then(function (x) { state.data.events = x.events; render(false); }).catch(function (err) { toast(err.message, true); }); } });
-  var hash = location.hash.slice(1); if (pages[hash]) state.page = hash; setInterval(function () { $('clock').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }, 30000); $('clock').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); setInterval(refresh, 30000); setInterval(history, 90000); auth(); render();
+  var hash = location.hash.slice(1); if (pages[hash]) state.page = hash; setInterval(function () { $('clock').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }, 30000); $('clock').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); setInterval(refresh, 60000); setInterval(history, 180000); auth(); render();
 }());

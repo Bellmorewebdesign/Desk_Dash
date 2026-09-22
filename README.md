@@ -28,7 +28,7 @@ chmod 600 .env
 python3 -m desk_dash.server
 ```
 
-Open `http://<CAPO-BOT-LAN-IP>:8765` on the tablet. `GET /health` reports backend readiness. The tablet does not need to stay connected for website or agent monitoring. The backend samples local metrics every ~10 seconds, websites every ~60 seconds, and remote agents every 15 seconds by default. The tablet fetches snapshots every 30 seconds and chart history every 90 seconds; background updates do not replay entrance animations. SQLite keeps 30 days of samples, site checks, remote reports, and activity events. The first utilization/rate sample may be unavailable until the next sample.
+Open `http://<CAPO-BOT-LAN-IP>:8765` on the tablet. `GET /health` reports backend readiness. The tablet does not need to stay connected for website or agent monitoring. The backend samples local metrics every ~10 seconds, websites every ~60 seconds, and remote agents every 15 seconds by default. The tablet fetches snapshots every 60 seconds and chart history every three minutes. Background updates change existing values in place without replaying entrance animations; the backend monitoring schedule stays independent of the tablet. SQLite keeps 30 days of samples, site checks, remote reports, and activity events. The first utilization/rate sample may be unavailable until the next sample.
 
 ### Start at boot with systemd
 
