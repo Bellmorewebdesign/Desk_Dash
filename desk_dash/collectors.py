@@ -1,5 +1,6 @@
 """Read-only Linux collectors. All external commands use fixed argument lists and timeouts."""
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -9,12 +10,12 @@ import subprocess
 import time
 
 
-def run(args, timeout=3):
+def run(args, timeout=3, allow_nonzero=False):
     if not shutil.which(args[0]):
         return None
     try:
         result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False, env={**os.environ, 'LC_ALL': 'C', 'SYSTEMD_PAGER': ''})
-        return result.stdout if result.returncode == 0 else None
+        return result.stdout if result.returncode == 0 or (allow_nonzero and result.stdout.lstrip().startswith('{')) else None
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -28,7 +29,8 @@ def read(path):
 
 def number(value):
     try:
-        return float(value)
+        value = float(value)
+        return value if math.isfinite(value) else None
     except (ValueError, TypeError):
         return None
 
@@ -135,29 +137,99 @@ def nvme_drives():
 
 
 def smart(device):
-    # NVMe CLI may require permissions. No secrets or serial numbers are returned.
-    raw = run(['nvme', 'smart-log', '-o', 'json', '/dev/' + device])
-    if raw:
-        try:
-            data = json.loads(raw)
-            kelvin = number(data.get('temperature'))
-            return {'source': 'nvme-cli', 'temperature': temperature(kelvin - 273.15 if kelvin and kelvin > 200 else kelvin, 'nvme'), 'health': 'GOOD' if number(data.get('critical_warning')) == 0 else 'WARNING', 'percentage_used': number(data.get('percentage_used')), 'power_on_hours': number(data.get('power_on_hours')), 'unsafe_shutdowns': number(data.get('unsafe_shutdowns')), 'media_errors': number(data.get('media_errors')), 'data_units_read': number(data.get('data_units_read')), 'data_units_written': number(data.get('data_units_written'))}
-        except (ValueError, TypeError):
-            pass
-    raw = run(['smartctl', '-j', '-a', '/dev/' + device])
+    # Namespace first, controller second. Never invoke sudo or leak device serials.
+    match = re.match(r'nvme\d+', device)
+    controller = match.group(0) if match else device
+    for path in ('/dev/' + device, '/dev/' + controller):
+        raw = run(['nvme', 'smart-log', '-o', 'json', path], allow_nonzero=True)
+        if raw:
+            try:
+                data = json.loads(raw)
+                if 'critical_warning' in data:
+                    return parse_nvme_smart(data, 'nvme-cli')
+            except (ValueError, TypeError):
+                pass
+    raw = run(['smartctl', '-j', '-a', '/dev/' + device], allow_nonzero=True)
     if raw:
         try:
             data = json.loads(raw)
             log = data.get('nvme_smart_health_information_log', {})
-            return {'source': 'smartctl', 'temperature': temperature(number(data.get('temperature', {}).get('current')), 'nvme'), 'health': 'GOOD' if data.get('smart_status', {}).get('passed') is True else 'WARNING' if data.get('smart_status', {}).get('passed') is False else 'UNAVAILABLE', 'percentage_used': number(log.get('percentage_used')), 'power_on_hours': number(log.get('power_on_hours')), 'unsafe_shutdowns': number(log.get('unsafe_shutdowns')), 'media_errors': number(log.get('media_errors')), 'data_units_read': number(log.get('data_units_read')), 'data_units_written': number(log.get('data_units_written'))}
+            if log:
+                result = parse_nvme_smart(log, 'smartctl')
+                if data.get('smart_status', {}).get('passed') is False:
+                    result['health'] = 'WARNING'
+                if result['temperature']['celsius'] is None:
+                    result['temperature'] = temperature(number(data.get('temperature', {}).get('current')), 'nvme')
+                return result
         except (ValueError, TypeError):
             pass
     for sensor in Path('/sys/class/hwmon').glob('hwmon*'):
-        if 'nvme' in (read(sensor / 'name') or '').lower():
+        if 'nvme' in (read(sensor / 'name') or '').lower() and controller in str(sensor.resolve()):
             value = number(read(sensor / 'temp1_input'))
             if value is not None:
-                return {'source': 'hwmon', 'temperature': temperature(value / 1000, 'nvme'), 'health': 'UNAVAILABLE'}
-    return {'source': None, 'temperature': temperature(None, 'nvme'), 'health': 'UNAVAILABLE'}
+                return {**empty_smart(), 'source': 'hwmon', 'temperature': temperature(value / 1000, 'nvme')}
+    return empty_smart()
+
+
+def empty_smart():
+    keys = ('available_spare', 'available_spare_threshold', 'percentage_used', 'power_cycles', 'power_on_hours', 'unsafe_shutdowns', 'media_errors', 'error_log_entries', 'warning_temp_time_minutes', 'critical_temp_time_minutes', 'data_units_read', 'data_units_written', 'data_read_bytes', 'data_written_bytes')
+    return {**{key: None for key in keys}, 'source': None, 'health': 'UNAVAILABLE', 'critical_warning': None, 'temperature': temperature(None, 'nvme'), 'temperature_sensors': []}
+
+
+def _nvme_celsius(raw):
+    value = number(raw)
+    return round(value - 273.15) if value is not None and value > 200 else value
+
+
+def parse_nvme_smart(data, source):
+    result = empty_smart()
+    result['source'] = source
+    warning = data.get('critical_warning')
+    try:
+        warning = int(warning, 0) if isinstance(warning, str) and warning.startswith('0x') else int(warning)
+    except (ValueError, TypeError):
+        warning = None
+    result['critical_warning'] = warning
+    result['temperature'] = temperature(_nvme_celsius(data.get('temperature')), 'nvme')
+    mapping = {
+        'available_spare': 'available_spare', 'available_spare_threshold': 'available_spare_threshold',
+        'percentage_used': 'percentage_used', 'power_cycles': 'power_cycles',
+        'power_on_hours': 'power_on_hours', 'unsafe_shutdowns': 'unsafe_shutdowns',
+        'media_errors': 'media_errors', 'error_log_entries': 'num_err_log_entries',
+        'warning_temp_time_minutes': 'warning_temp_time', 'critical_temp_time_minutes': 'critical_comp_time',
+        'data_units_read': 'data_units_read', 'data_units_written': 'data_units_written',
+    }
+    for output_key, input_key in mapping.items():
+        result[output_key] = number(data.get(input_key))
+    for direction in ('read', 'written'):
+        units = result['data_units_' + direction]
+        result['data_' + direction + '_bytes'] = int(units * 512000) if units is not None else None
+    for index in range(1, 9):
+        raw = data.get('temperature_sensor_' + str(index), data.get('temp_sensor_' + str(index)))
+        value = _nvme_celsius(raw)
+        if value is not None and -20 <= value <= 125:
+            result['temperature_sensors'].append({'index': index, 'temperature': temperature(value, 'nvme')})
+    spare, minimum = result['available_spare'], result['available_spare_threshold']
+    degraded_spare = spare is not None and minimum is not None and spare < minimum
+    if warning is not None:
+        result['health'] = 'WARNING' if warning != 0 or degraded_spare or (result['media_errors'] or 0) > 0 else 'GOOD'
+    # Unsafe shutdown count is informational, not a SMART failure on its own.
+    return result
+
+
+def auxiliary_sensors():
+    readings = []
+    for sensor in Path('/sys/class/hwmon').glob('hwmon*'):
+        name = read(sensor / 'name') or ''
+        if name in ('k10temp', 'coretemp', 'nvme'):
+            continue
+        for file in sensor.glob('temp*_input'):
+            value = number(read(file))
+            if value is None or not -20 <= value / 1000 <= 125:
+                continue
+            label = read(str(file).replace('_input', '_label')) or name
+            readings.append({'name': name[:50], 'label': label[:80], 'temperature': temperature(value / 1000)})
+    return readings[:24]
 
 
 def gateway():
@@ -266,4 +338,4 @@ class Sampler:
             loads = [round(x, 2) for x in os.getloadavg()]
         except OSError:
             loads = None
-        return {'ts': time.time(), 'hostname': socket.gethostname(), 'cpu': {'model': model, 'percent': cpu_percent, 'mhz': round(sum(mhz) / len(mhz)) if mhz else None, 'temperature': cpu_temperature(), 'load': loads}, 'ram': {'total_bytes': mem.get('MemTotal'), 'used_bytes': mem.get('MemTotal', 0) - mem.get('MemAvailable', 0)}, 'gpu': gpu(), 'uptime_seconds': int(float(uptime)), 'process_count': len(list(Path('/proc').glob('[0-9]*'))), 'network_interfaces': throughput, 'filesystems': filesystems(), 'drives': drives}
+        return {'ts': time.time(), 'hostname': socket.gethostname(), 'cpu': {'model': model, 'percent': cpu_percent, 'mhz': round(sum(mhz) / len(mhz)) if mhz else None, 'temperature': cpu_temperature(), 'load': loads}, 'ram': {'total_bytes': mem.get('MemTotal'), 'used_bytes': mem.get('MemTotal', 0) - mem.get('MemAvailable', 0)}, 'gpu': gpu(), 'uptime_seconds': int(float(uptime)), 'process_count': len(list(Path('/proc').glob('[0-9]*'))), 'network_interfaces': throughput, 'filesystems': filesystems(), 'drives': drives, 'auxiliary_sensors': auxiliary_sensors()}

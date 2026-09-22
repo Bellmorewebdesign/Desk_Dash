@@ -20,6 +20,7 @@ from .actions import ActionError, reboot, service_action, storage_target, storag
 from .checks import check_site
 from .collectors import Sampler, discover_alfred, network_probe, service, temperature
 from .config import load_config, load_env
+from .remotes import RemoteMonitor
 from .store import Store
 
 STATIC = Path(__file__).resolve().parent.parent / 'static'
@@ -27,9 +28,9 @@ LOG = logging.getLogger('desk_dash')
 
 
 class State:
-    def __init__(self, config, store, password='', agent_token=''):
+    def __init__(self, config, store, password=''):
         self.config, self.store = config, store
-        self.password, self.agent_token = password, agent_token
+        self.password = password
         self.lock = threading.RLock()
         self.sampler = Sampler()
         self.system = None
@@ -38,7 +39,7 @@ class State:
         self.network = None
         self.prev_service_cpu = {}
         self.prev_service_at = None
-        self.remotes = []
+        self.remotes = RemoteMonitor(config.get('remote_agents', []), store)
         self.sessions = {}
         self.failed_logins = {}
         self.started = time.time()
@@ -86,20 +87,15 @@ class State:
                 self.sites[entry['id']] = result
 
     def remotes_tick(self):
-        results = []
-        for entry in self.config.get('remote_agents', []):
+        self.remotes.poll_all()
+
+    def remote_loop(self):
+        while not self.stop.is_set():
             try:
-                url = entry['url']
-                if not url.startswith(('http://', 'https://')):
-                    raise ValueError('Bad URL')
-                request = urllib.request.Request(url.rstrip('/') + '/api/agent', headers={'Authorization': 'Bearer ' + entry['token']})
-                with urllib.request.urlopen(request, timeout=3) as response:
-                    data = json.load(response)
-                results.append({'name': entry['name'], 'status': 'RUNNING', 'system': data})
+                self.remotes_tick()
             except Exception:
-                results.append({'name': entry.get('name', 'Remote'), 'status': 'OFFLINE', 'system': None})
-        with self.lock:
-            self.remotes = results
+                LOG.exception('Remote polling cycle failed')
+            self.stop.wait(self.config.get('remote_poll_seconds', 15))
 
     def loop(self):
         next_web, next_network, next_prune = 0, 0, 0
@@ -110,7 +106,6 @@ class State:
                 if started >= next_web or self.refresh_sites.is_set():
                     self.refresh_sites.clear()
                     self.sites_tick()
-                    self.remotes_tick()
                     next_web = started + 60
                 if started >= next_network:
                     probe = network_probe()
@@ -126,7 +121,9 @@ class State:
 
     def snapshot(self):
         with self.lock:
-            return {'system': self.system, 'sites': list(self.sites.values()), 'services': self.services, 'network': self.network, 'remotes': self.remotes, 'events': self.store.events(limit=100), 'server_time': time.time(), 'started': self.started, 'storage_test_configured': bool(self.config.get('storage_test', {}).get('directory')), 'controls': {'services': self.config['controls'].get('service_units', []), 'reboot': self.config['controls'].get('allow_reboot', False), 'wake_targets': [x['id'] for x in self.config['controls'].get('wake_targets', [])]}}
+            remotes = self.remotes.snapshot()
+            local = {'id': 'local', 'name': self.config.get('host_label', 'Capo-Bot'), 'status': 'ONLINE' if self.system else 'CONNECTING', 'system': self.system, 'last_success': self.system['ts'] if self.system else None, 'last_polled': self.system['ts'] if self.system else None}
+            return {'system': self.system, 'machines': [local] + remotes, 'sites': list(self.sites.values()), 'services': self.services, 'network': self.network, 'remotes': remotes, 'events': self.store.events(limit=100), 'server_time': time.time(), 'started': self.started, 'storage_test_configured': bool(self.config.get('storage_test', {}).get('directory')), 'controls': {'services': self.config['controls'].get('service_units', []), 'reboot': self.config['controls'].get('allow_reboot', False), 'wake_targets': [x['id'] for x in self.config['controls'].get('wake_targets', [])]}}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -185,27 +182,25 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == '/health':
             return self.json({'ok': True, 'monitoring': self.state.system is not None})
-        if self.server.agent_mode and path != '/api/agent':
-            return self.json({'error': 'Not found'}, 404)
         if path == '/api/auth':
             info = self.session()
             return self.json({'authenticated': bool(info), 'password_required': bool(self.state.password), 'controls_enabled': bool(self.state.password), 'csrf': info['csrf'] if info else None})
-        if path == '/api/agent':
-            bearer = self.headers.get('Authorization', '')
-            if not self.state.agent_token or not hmac.compare_digest(bearer, 'Bearer ' + self.state.agent_token):
-                return self.json({'error': 'Forbidden'}, 403)
-            return self.json(self.state.system or {})
         if path.startswith('/api/'):
             if not self.authorized():
                 return self.json({'error': 'Authentication required'}, 401)
             if path == '/api/snapshot':
                 return self.json(self.state.snapshot())
             if path == '/api/history':
+                machine = parse_qs(urlparse(self.path).query).get('machine', [''])[0]
+                if machine:
+                    if machine not in (entry['id'] for entry in self.state.config.get('remote_agents', [])):
+                        return self.json({'error': 'Unknown machine'}, 404)
+                    return self.json({'samples': self.state.store.remote_history(machine)})
                 return self.json({'samples': self.state.store.history()})
             if path == '/api/events':
                 query = parse_qs(urlparse(self.path).query)
                 kind = query.get('kind', [''])[0]
-                if kind not in ('', 'website', 'service', 'temperature', 'storage', 'control', 'system'):
+                if kind not in ('', 'website', 'service', 'temperature', 'storage', 'control', 'system', 'machine'):
                     return self.json({'error': 'Invalid filter'}, 400)
                 return self.json({'events': self.state.store.events(kind)})
             if path == '/api/storage-test/preview':
@@ -236,8 +231,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self):
-        if self.server.agent_mode:
-            return self.json({'error': 'Not found'}, 404)
         path = urlparse(self.path).path
         if path not in ('/api/login', '/api/logout', '/api/action'):
             return self.json({'error': 'Not found'}, 404)
@@ -314,31 +307,33 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description='Desk Dash Linux monitoring dashboard')
-    parser.add_argument('--agent', action='store_true', help='Expose only a token-protected metric endpoint')
+    parser.add_argument('--agent', action='store_true', help='Compatibility alias for the separate read-only agent')
     args = parser.parse_args()
+    if args.agent:
+        from .agent import serve_agent
+        return serve_agent()
     root = Path(__file__).resolve().parent.parent
     load_env(root / '.env')
     config = load_config(os.getenv('DASH_CONFIG', str(root / 'config.json')))
     data_dir = Path(os.getenv('DASH_DATA_DIR', str(root / 'data'))).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
     store = Store(data_dir / 'desk-dash.sqlite3')
-    password, agent_token = os.getenv('DASH_PASSWORD', ''), os.getenv('DASH_AGENT_TOKEN', '')
+    password = os.getenv('DASH_PASSWORD', '')
     host = os.getenv('DASH_HOST', '127.0.0.1')
-    if host not in ('127.0.0.1', '::1', 'localhost') and not (password or (args.agent and agent_token)):
-        parser.error('LAN binding requires DASH_PASSWORD (or DASH_AGENT_TOKEN in agent mode)')
-    if args.agent and not agent_token:
-        parser.error('Agent mode requires DASH_AGENT_TOKEN')
+    if host not in ('127.0.0.1', '::1', 'localhost') and not password:
+        parser.error('LAN binding requires DASH_PASSWORD')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    state = State(config, store, password, agent_token)
+    state = State(config, store, password)
     state.tick()
     state.store.event('system', 'info', 'Desk Dash backend started')
     thread = threading.Thread(target=state.loop, daemon=True, name='monitor')
     thread.start()
+    remote_thread = threading.Thread(target=state.remote_loop, daemon=True, name='remote-monitor')
+    remote_thread.start()
     class Server(ThreadingHTTPServer):
         daemon_threads = True
     server = Server((host, int(os.getenv('DASH_PORT', '8765'))), Handler)
     server.state = state
-    server.agent_mode = args.agent
     LOG.info('Desk Dash listening on http://%s:%s', host, server.server_port)
     try:
         server.serve_forever()

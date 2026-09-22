@@ -1,12 +1,13 @@
 {
   "sites": [
-    {"id": "bellmore-web-design", "name": "Bellmore Web Design", "url": "https://bellmorewebdesign.com", "expected_statuses": [200, 301, 302]},
-    {"id": "coursen", "name": "Coursen", "url": "", "enabled": false, "expected_statuses": [200, 301, 302]}
+    {"id": "bellmore-web-design", "name": "Bellmore Web Design", "url": "https://bellmorewebdesign.com", "expected_statuses": [200], "timeout_seconds": 6, "degraded_ms": 1500, "failure_threshold": 3, "allow_redirects": true},
+    {"id": "coursen", "name": "Coursen", "url": "", "url_env": "DASH_COURSEN_URL", "enabled": false, "expected_statuses": [200], "timeout_seconds": 6, "degraded_ms": 1500, "failure_threshold": 3, "allow_redirects": true}
   ],
   "services": [
     {"id": "alfred", "name": "Alfred", "unit": "alfred.service", "scope": "system"}
   ],
   "remote_agents": [],
+  "remote_poll_seconds": 15,
   "known_devices": [],
   "controls": {"service_units": [], "allow_reboot": false, "wake_targets": []},
   "storage_test": {"directory": "", "size_mib": 128, "cooldown_seconds": 3600}

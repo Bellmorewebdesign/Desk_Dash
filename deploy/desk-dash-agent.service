@@ -7,14 +7,13 @@ Wants=network-online.target
 Type=simple
 User=REPLACE_WITH_LINUX_USERNAME
 WorkingDirectory=/opt/desk-dash
-ExecStart=/usr/bin/python3 -m desk_dash.server --agent
+ExecStart=/usr/bin/python3 -m desk_dash.agent
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/opt/desk-dash/data
 PrivateTmp=true
 
 [Install]

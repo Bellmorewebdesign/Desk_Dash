@@ -1,72 +1,38 @@
 # Desk Dash
 
-A lightweight, local infrastructure dashboard for an Ubuntu host and an older Android tablet. Python standard library backend, SQLite history, and a static HTML/CSS/JavaScript frontend; no `npm install`, build step, or public cloud service. Works in landscape and portrait, with reduced-motion support. Metrics come from the **machine running the backend**, not the tablet.
+Desk Dash runs on **Capo-Bot** and serves a lightweight eight-page monitoring UI to a Galaxy tablet. Capo-Bot gathers its own Linux/NVIDIA/NVMe metrics, checks websites in the background, and polls read-only agents on other computers. The browser contacts only Capo-Bot:
 
-## Host discovery first
-
-Run on the RTX 3080 Ubuntu PC **before editing the host configuration**:
-
-```sh
-python3 -m desk_dash.discover > discovery.json
+```text
+Second PC agent → Capo-Bot backend + SQLite → Galaxy tablet
 ```
 
-This read-only report lists CPU/RAM/GPU, NVIDIA driver, block devices and mount points, NVMe SMART data, sensors, interfaces, installed utilities, relevant systemd units, Docker/PM2 apps, and Alfred processes. Review it locally; do not publish the report if it contains host details you consider private. This repository was developed in a separate container, so your 3080/NVMe specifics cannot be asserted until the script runs there. It does not install or modify packages.
+The backend and UI use the Python standard library and plain JavaScript. No build step or cloud service is required. The target host is a Ryzen 5 7600 with 32 GB RAM, an RTX 3080 10 GB, and a Lexar NM790 1 TB NVMe. These hardware names are **detected at runtime**; they are not hardcoded into collectors. The separate Windows agent requires LibreHardwareMonitor for actual CPU/GPU temperatures.
 
-## Start locally
-
-Requires Python 3.10+ and Linux with `/proc` and `/sys` available. NVIDIA, SMART and sensor utilities are optional. Missing capabilities display **UNAVAILABLE**.
+## Update and inspect on Capo-Bot
 
 ```sh
-git clone https://github.com/Bellmorewebdesign/Desk_Dash.git
-cd Desk_Dash
-cp config.example.json config.json
-cp .env.example .env
+cd ~/Desk_Dash
+git pull origin main
+python3 -m desk_dash.discover > discovery.json
+python3 -m unittest discover -s tests -v
+cp -n config.example.json config.json
+cp -n .env.example .env
+```
+
+Review `discovery.json` locally. It is read-only and identifies CPU, RAM, GPU, sensors, NVMe, mounted filesystems, utilities, systemd candidates, Docker/PM2 apps, and Alfred processes. Do not publish it if it contains private host details. Existing `config.json` and `.env` files are ignored by Git; compare new example settings if upgrading.
+
+For a manual run, set `DASH_HOST` to Capo-Bot's specific LAN IP and a long unique `DASH_PASSWORD` in `.env`, then:
+
+```sh
+chmod 600 .env
 python3 -m desk_dash.server
 ```
 
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765) on the host. `GET /health` returns server readiness; `GET /api/snapshot`, `/api/history`, `/api/events` return normalized live and historical data. The first CPU/network sample may lack a rate until the next sample. Background samples run about every 10 seconds; website/remote/network probes about every 60 seconds. SQLite retains 30 days of checks, samples and events.
+Open `http://<CAPO-BOT-LAN-IP>:8765` on the tablet. `GET /health` reports backend readiness. The tablet does not need to stay connected for website or agent monitoring. The backend samples local metrics every ~10 seconds, websites every ~60 seconds, and remote agents every 15 seconds by default. The tablet fetches snapshots every 30 seconds and chart history every 90 seconds; background updates do not replay entrance animations. SQLite keeps 30 days of samples, site checks, remote reports, and activity events. The first utilization/rate sample may be unavailable until the next sample.
 
-### Access from the Galaxy tablet
+### Start at boot with systemd
 
-1. Set a long unique `DASH_PASSWORD` and `DASH_HOST` to your 3080 PC's **specific LAN IP** in `.env`. Example: `DASH_HOST=192.168.1.50`. Keep `.env` readable only by the service user: `chmod 600 .env`.
-2. Start the server. Open `http://<3080-PC-LAN-IP>:8765` on the tablet's browser. Place the tablet and PC on your trusted private Wi-Fi/LAN. A private LAN password is sent over ordinary HTTP unless you add a local TLS reverse proxy; do not port-forward this service or expose it to the internet.
-3. To keep the display awake, configure the tablet's screen/charging settings separately.
-
-For read-only browsing on `127.0.0.1`, a password is optional. **All controls require a password and a signed-in session**, including refresh actions. Binding to a non-loopback address requires a password. The login uses a 30-day HttpOnly SameSite cookie and a separate CSRF token; action POSTs validate the exact Origin and rate limits. Sessions are kept in memory, so a server restart requires signing in again. Five failed login attempts from one IP temporarily block more attempts. The service writes no secrets to logs or API responses. If you change the password, restart the process (existing in-memory sessions then expire).
-
-## Host configuration
-
-`config.json` is local configuration; it can contain private agent tokens, so it is excluded from Git. Start from `config.example.json`.
-
-### Websites
-
-Edit `sites` entries with a stable `id`, display `name`, URL and allowed HTTP codes. The example includes Bellmore Web Design and a Coursen entry marked **UNCONFIGURED** because its actual public address has not been verified. To monitor Coursen, set its real URL and change `enabled` to `true`. Redirects count as healthy only when their code appears in `expected_statuses`; response times at or above `degraded_ms` (default 1500) show DEGRADED. A 4xx also shows DEGRADED, a network error or 5xx OFFLINE. Remove or add entries, then restart. No other sites are preconfigured. Uptime is computed from recorded checks; it starts empty and is not a historical SLA.
-
-### Services and approved actions
-
-Set `services` to the **actual systemd unit names** from your discovery report, for example `{"id":"alfred","name":"Alfred","unit":"alfred.service","scope":"system"}`. A process whose `/proc/<pid>/comm` contains Alfred is shown as discovered if present. Systemd exposes current PID, memory, cumulative CPU time and activation timestamps; CPU percentage is estimated from the change in a unit's cumulative CPU time between samples. Other Node/Python/PM2/Docker applications can be monitored by adding their **systemd wrapper unit**. Container/PM2 discovery is read-only during setup; the dashboard does not enumerate all host services.
-
-`controls.service_units` is a separate list of exact **system** unit names allowed for start/stop/restart. By default it is empty, as are Wake-on-LAN targets; reboot is disabled. Every action validates this list on the server. The `desk-dash` user needs appropriate permissions to manage an approved unit. Prefer a narrowly scoped policy; do not run Desk Dash as root merely to make every action work. User units can be monitored with `scope: "user"` but control actions currently target system units. Configure `controls.wake_targets` with `id`, colon-delimited `mac` and optional `broadcast`. Reboot requires `allow_reboot: true` plus appropriate systemd permissions. Confirm dialogs, a server-side confirmation phrase and cooldowns protect every sensitive action. **No arbitrary shell API exists.**
-
-### NVMe SMART and storage test
-
-NVMe namespaces are discovered from `/sys/class/block`, with directly mounted partitions mapped through `/proc/mounts`. SMART uses `nvme smart-log -o json` when available, then `smartctl -j -a`, then hwmon temperature. Without these tools or access, some fields say UNAVAILABLE; choose read-only tooling/permissions according to your OS. Drive health, wear, errors, power-on hours, temperatures, mount capacity and `/proc/diskstats` rates are displayed when possible. A SMART `data_units_read` or `data_units_written` value is a drive unit, typically 512,000 bytes, **not a byte count**.
-
-The storage test remains disabled until `storage_test.directory` points to a writable directory **on a directly mounted detected NVMe partition**, such as `/mnt/my-nvme/desk-dash-test`. It rejects overlay mounts, a different filesystem, arbitrary devices, LVM/crypt paths it cannot verify, invalid sizes, and low free space. The browser previews exact drive, directory and size before asking for confirmation. The backend exclusively creates a new temporary file, writes a random 1 MiB block repeatedly (default 128 MiB; configurable 16–256 MiB), calls `fsync`, hashes the write and read, and unlinks the file in `finally`. It never writes to a block device or an existing filename. An SQLite-backed cooldown defaults to one hour and cannot be set below ten minutes. A real test still causes a limited amount of SSD wear. Read speed is an approximation and may reflect Linux page cache, **not raw disk read performance**. A machine that crashes mid-test may leave a `.desk-dash-test-*.tmp` file in the configured directory; remove it manually after verifying no test is active. No real test is run as part of development or automated tests.
-
-### Second PC
-
-On the second Linux machine, use this same project with `.env` containing `DASH_AGENT_TOKEN=<long-random-token>`, its LAN-specific `DASH_HOST`, and `DASH_PORT=8765`; run `python3 -m desk_dash.server --agent`. Configure `remote_agents` on the central host:
-
-```json
-[{"name":"Second PC","url":"http://192.168.1.60:8765","token":"same-long-random-token"}]
-```
-
-The host polls `/api/agent` every minute. The token is sent over HTTP on your LAN; use local TLS or a trusted network if needed. The agent serves only `/health` and `/api/agent`; it has no control UI. A Windows PC would require a separate Windows collector; this agent reads Linux `/proc` and `/sys`.
-
-## systemd on the 3080 host
-
-After copying or cloning the project into `/opt/desk-dash`, set ownership to the intended non-root Linux user. Copy example config/environment files and set host IP/password as above. The example unit assumes data in `/opt/desk-dash/data`; create it with write permission for that user. Edit `deploy/desk-dash.service` to replace `REPLACE_WITH_LINUX_USERNAME` and `WorkingDirectory`/`ReadWritePaths` if the project lives elsewhere. Install the unit with administrator privileges:
+`deploy/desk-dash.service` is an example for `/opt/desk-dash`. Replace the username and paths if your actual checkout is `~/Desk_Dash`. Create a writable data directory, keep `.env` private, and edit `WorkingDirectory`, `ReadWritePaths`, and `ExecStart` before installing the unit:
 
 ```sh
 sudo cp deploy/desk-dash.service /etc/systemd/system/desk-dash.service
@@ -76,17 +42,76 @@ systemctl status desk-dash.service
 journalctl -u desk-dash.service -n 50 --no-pager
 ```
 
-The sample uses filesystem hardening and grants write access only to the data folder; the storage test folder may need an additional `ReadWritePaths=` entry. It does not grant service-control privileges. The optional `deploy/desk-dash-agent.service` is for the second PC.
+The example runs as a non-root user and limits filesystem writes. If the storage test folder is outside its writable path, add that exact folder to `ReadWritePaths=`. Do not enable a unit with the placeholder username. No deployment or service restart on Capo-Bot was performed while developing this update.
 
-## Project structure
+## Websites
 
-- `desk_dash/collectors.py`: read-only CPU, GPU, RAM, NVMe, sensor, network and systemd collectors.
-- `desk_dash/checks.py`: backend website probes and redirect classification.
-- `desk_dash/store.py`: SQLite checks, samples, activity and cooldowns.
-- `desk_dash/actions.py`: allowlisted controls and limited temporary-file NVMe test.
-- `desk_dash/server.py`: HTTP API, login, CSRF, scheduling and static file server.
-- `desk_dash/discover.py`: read-only host discovery report.
-- `static/`: no-build tablet UI with eight pages.
-- `deploy/`: example systemd units.
+`config.example.json` includes Bellmore Web Design at `https://bellmorewebdesign.com` and an **UNCONFIGURED** Coursen entry. The Coursen domain was not provided, so enter its real health-check URL in `config.json` with `enabled: true`, or set `DASH_COURSEN_URL=<real URL>` in `.env` to enable the existing entry automatically. Add more entries to `sites` and restart the backend. No other sites are preconfigured.
 
-Development checks: `python3 -m unittest discover -s tests -v`, `node --check static/app.js` (if Node is installed), and `python3 -m desk_dash.server` then open the dashboard. No third-party packages are required.
+Each website has `timeout_seconds`, `degraded_ms`, `expected_statuses`, `allow_redirects`, and `failure_threshold`. Redirects are followed by default (maximum five), and the final HTTP code is checked. An expected HTTP response counts as a successful check; slow responses show **DEGRADED**. With the default threshold of three, the first two failed checks show **DEGRADED**, and the third shows **OFFLINE**. A valid response recovers immediately. Each backend check writes its code, latency, outcome, timestamp, and status to SQLite. The UI shows last check, last accepted response, uptime from recorded checks, response history, consecutive failures, and outage/recovery events. Checks continue while the browser is closed.
+
+## Read-only agents for other computers
+
+Capo-Bot polls `GET /api/agent/v1` with a bearer token and accepts only versioned normalized JSON. The agent reports hostname, CPU/GPU model, temperature and utilization, RAM, VRAM, GPU power/fan if available, disks, uptime, interface throughput, and measurement time. The central server checks types and timestamps, recomputes temperature classifications, stores samples and check states, and never sends secrets to the tablet.
+
+On a failed poll, **current temperatures disappear immediately**. The status moves through **DEGRADED**, **STALE** (after `stale_after_seconds`), then **OFFLINE** (after `offline_after_seconds`). The last successful report time stays visible. A delayed or malformed sample does not count as a successful report. Historic readings remain available in the Systems page graph and `GET /api/history?machine=<id>`; they are explicitly historic, not live. When communication recovers, the event feed records it.
+
+On the remote computer, generate a different strong secret for each agent:
+
+```sh
+python3 -m desk_dash.agent --generate-token
+```
+
+Store that secret in the agent machine's `.env` as `DASH_AGENT_TOKEN=...`. Set `DASH_AGENT_HOST` to that PC's LAN IP, and optionally `DASH_AGENT_PORT=8766`. On Capo-Bot, store the same secret **only** in its `.env`, for example `DASH_AGENT_SECOND_TOKEN=...`, and add this to `remote_agents` in `config.json`:
+
+```json
+{
+  "id": "second-pc",
+  "name": "Second PC",
+  "url": "http://192.168.1.60:8766",
+  "token_env": "DASH_AGENT_SECOND_TOKEN",
+  "stale_after_seconds": 45,
+  "offline_after_seconds": 120,
+  "timeout_seconds": 3
+}
+```
+
+`remote_agents` is a JSON **array** of such objects. Keep the token out of `config.json` and Git. Restart Capo-Bot after edits. The agent serves only `/health` and `/api/agent/v1`; every POST returns 405. It has no remote control or command-execution endpoint. Put both machines on a trusted private LAN; bearer tokens travel in cleartext over plain HTTP unless you configure local TLS. Never port-forward either service.
+
+### Linux second PC
+
+Python 3.10+ and Linux `/proc`/`/sys` are required. From its Desk Dash checkout, create `.env` with the agent settings above, then run `python3 -m desk_dash.agent`. The example `deploy/desk-dash-agent.service` starts it at boot after you replace the username and paths. The agent does not need `config.json` or access to Capo-Bot's SQLite file. `python3 -m desk_dash.server --agent` remains a compatibility alias, but the dedicated module is preferred.
+
+### Windows second PC and real sensor readings
+
+The Windows agent uses Windows CIM/OS counters for CPU load, RAM, disks, uptime, processes, and network traffic. For **actual CPU/GPU temperatures** it reads LibreHardwareMonitor's local `data.json` sensor feed. It also uses `nvidia-smi` when available for NVIDIA GPU fields. If CPU or installed GPU temperature is unavailable, the central dashboard marks the machine **DEGRADED** rather than presenting OS-only counters as a complete sensor report.
+
+1. Install Python 3.10+ on the Windows PC and obtain LibreHardwareMonitor from its [official GitHub releases](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases). Keep LibreHardwareMonitor running and verify its CPU and GPU temperature readings in the app.
+2. Enable its built-in web server, set its **listener IP to `127.0.0.1`** and port to `8085`, and verify `http://127.0.0.1:8085/data.json` returns a sensor tree containing `RawValue` temperature readings. Do not leave the LibreHardwareMonitor server bound to all interfaces: its built-in HTTP server includes sensor-control endpoints. Desk Dash reads only `data.json` over loopback and never exposes that server to the LAN. Some sensors require LibreHardwareMonitor to run with administrator rights; assess that on the Windows PC.
+3. From the Desk Dash checkout in PowerShell, run `py -3 -m desk_dash.agent --generate-token`. Create a private `.env` with `DASH_AGENT_TOKEN`, `DASH_AGENT_HOST=<WINDOWS-LAN-IP>`, `DASH_AGENT_PORT=8766`, and `DASH_LHM_URL=http://127.0.0.1:8085/data.json`. Run `py -3 -m desk_dash.agent`. Allow only Capo-Bot's LAN IP to reach port 8766 in Windows Firewall.
+4. After verifying the CPU and GPU temperatures on Capo-Bot's Systems page, add a Task Scheduler task for `py.exe -3 -m desk_dash.agent`, working directory set to the checkout, delayed until after LibreHardwareMonitor starts at login. Store `.env` with Windows permissions restricted to your account.
+
+LibreHardwareMonitor's official code documents the JSON endpoint and `RawValue` fields; its older WMI integration has had version-specific reports of missing sensors, so this agent uses the local JSON feed. No Windows hardware has been available in this development environment, so confirm the sensor names and hardware compatibility on the second PC before treating it as fully monitored.
+
+## NVMe and storage test
+
+The NVMe collector discovers real namespaces from `/sys/class/block`, then tries read-only `nvme smart-log -o json` on the namespace and controller, followed by `smartctl -j -a` and hwmon temperature. The Storage page shows available spare and threshold, wear percentage, power cycles/hours, unsafe shutdowns, media and error-log counts, warning/critical temperature time, composite and per-sensor temperatures, data read/written, filesystem capacity, and current throughput where available. NVMe data units are converted at **512,000 bytes each**. **Unsafe shutdowns alone do not mark a healthy drive as failed.** Critical warnings, insufficient spare, or media errors do affect the health label.
+
+`sudo nvme smart-log /dev/nvme0` succeeding interactively does **not** mean a non-root systemd process can read SMART. Desk Dash never runs `sudo` from its web backend. If SMART is inaccessible to the service user, hwmon temperature still appears and the unavailable health fields remain clearly labeled; arrange the least privilege read access separately on Capo-Bot if needed.
+
+The optional storage test remains disabled until `storage_test.directory` points to a writable directory on a **directly mounted NVMe filesystem**. It uses an exclusive temporary file, writes 16–256 MiB (default 128), `fsync`s, verifies a read-back hash, deletes the file, and enforces a cooldown of at least ten minutes (default one hour). It never writes to a block device or an existing file. Read throughput may come from page cache. A crash can leave a `.desk-dash-test-*.tmp` file for manual cleanup. No storage test was run while developing this update.
+
+## Controls and security
+
+Controls are separate from read-only agent collection. The dashboard uses a password, HttpOnly SameSite cookie, CSRF token, Origin check, confirmations and cooldowns. `controls.service_units` is the exact allowlist for systemd start/stop/restart; reboot and Wake-on-LAN are disabled until explicitly configured. The agent has no such endpoints. Neither service exposes arbitrary shell or PowerShell execution. Never publish it through port forwarding or a tunnel without redesigning authentication and transport security.
+
+## Project structure and checks
+
+- `desk_dash/agent.py`, `protocol.py`, `remotes.py`, `windows.py`: authenticated read-only agent, versioned schema, central polling/history, Windows sensor mapping.
+- `deploy/windows-metrics.ps1`: read-only Windows OS counters; LibreHardwareMonitor provides temperatures.
+- `desk_dash/collectors.py`, `checks.py`, `store.py`: local Linux/SMART collection, website checks, SQLite history.
+- `desk_dash/server.py`, `actions.py`: dashboard API, scheduler, login, allowlisted actions.
+- `static/`: no-build, touch-friendly UI with text status labels and reduced-motion support.
+- `deploy/`: example Linux systemd units.
+
+Run `python3 -m unittest discover -s tests -v` and (if Node is installed) `node --check static/app.js`. The automated tests cover protocol validation, remote stale/offline/recovery behavior, agent authentication, website failure thresholds, and SMART interpretation. Windows hardware and Capo-Bot-specific sensor permissions must be verified on those machines.
