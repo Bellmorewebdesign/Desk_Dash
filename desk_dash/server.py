@@ -59,8 +59,12 @@ class State:
                     self.prev_service_cpu[entry['id']] = usage
             self.prev_service_at = now
             alfred = discover_alfred()
-            if alfred and not any(s['id'] == alfred['id'] or s['name'].lower() == 'alfred' for s in configured):
-                configured.append(alfred)
+            if alfred:
+                matching = next((i for i, item in enumerate(configured) if item['name'].lower() == 'alfred' and item['status'] == 'UNAVAILABLE'), None)
+                if matching is not None:
+                    configured[matching] = alfred
+                elif not any(item['pid'] == alfred['pid'] for item in configured):
+                    configured.append(alfred)
             self.services = configured
             if old:
                 for key in ('cpu', 'gpu'):
@@ -122,7 +126,7 @@ class State:
 
     def snapshot(self):
         with self.lock:
-            return {'system': self.system, 'sites': list(self.sites.values()), 'services': self.services, 'network': self.network, 'remotes': self.remotes, 'events': self.store.events(limit=12), 'server_time': time.time(), 'started': self.started, 'storage_test_configured': bool(self.config.get('storage_test', {}).get('directory')), 'controls': {'services': self.config['controls'].get('service_units', []), 'reboot': self.config['controls'].get('allow_reboot', False), 'wake_targets': [x['id'] for x in self.config['controls'].get('wake_targets', [])]}}
+            return {'system': self.system, 'sites': list(self.sites.values()), 'services': self.services, 'network': self.network, 'remotes': self.remotes, 'events': self.store.events(limit=100), 'server_time': time.time(), 'started': self.started, 'storage_test_configured': bool(self.config.get('storage_test', {}).get('directory')), 'controls': {'services': self.config['controls'].get('service_units', []), 'reboot': self.config['controls'].get('allow_reboot', False), 'wake_targets': [x['id'] for x in self.config['controls'].get('wake_targets', [])]}}
 
 
 class Handler(BaseHTTPRequestHandler):
